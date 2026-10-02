@@ -67,9 +67,13 @@ const (
 // 关闭顺序：
 // 1. main() 调用 Hub.Stop() → 关闭 done channel
 // 2. Run() 检测到 done 关闭 → 退出循环
-// 3. Stop() 关闭所有 client.send channel → writePump 退出
+// 3. Stop() 调用每个 client.closeSend() → 关闭 client.done → writePump 退出
 // 4. writePump 退出后关闭 conn → readPump 读取失败退出
 // 5. WaitGroup 计数归零 → main() 的 hub.Wait() 返回，继续退出
+//
+// ⚠️ 注意：client.send 通道**故意不被关闭**（见 Client 结构体注释）。
+// 由于该通道可能被其它客户端的 goroutine 并发写入（文件分片转发），
+// 关闭它会产生 panic: send on closed channel。改用 client.done 通知退出。
 type Hub struct {
 	roomManager     *room.RoomManager
 	hubRegistry     *hub.HubRegistry // public room directory registry (nil = Hub disabled)
@@ -344,7 +348,12 @@ func (h *Hub) Run() {
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
-				close(client.send)
+				// ⚠️ 不 close(client.send)！
+				// send 通道可能被其它客户端的 goroutine 并发写入
+				// （文件分片经 BroadcastFileData 跨连接转发），
+				// 关闭它会产生 panic: send on closed channel，导致整个进程崩溃。
+				// 改为关闭 client.done 通知 writePump 退出，通道交由 GC 回收。
+				client.closeSend()
 			}
 			h.mu.Unlock()
 
@@ -397,9 +406,9 @@ func (h *Hub) Run() {
 //
 // 📚 学习要点: 关闭顺序的重要性
 // 1. 先 close(done) — 让 Run() 退出，不再处理 register/unregister
-// 2. 再 close(client.send) — 让每个 writePump 退出
+// 2. 再对每个 client 调用 closeSend()（关闭 client.done）— 让 writePump 退出
 // 3. writePump 退出时关闭 WebSocket conn — 让 readPump 读取失败退出
-// 这个顺序确保不会出现「向已关闭 channel 发送」的 panic。
+// 该顺序配合「不关闭 send 通道」的策略，确保不会出现「向已关闭 channel 发送」的 panic。
 //
 // 📚 学习要点: 为什么使用 Lock()（写锁）而非 RLock()（读锁）？
 // Stop() 需要修改 clients map（delete 操作）和关闭 send channel，
@@ -411,7 +420,10 @@ func (h *Hub) Stop() {
 
 	h.mu.Lock()
 	for client := range h.clients {
-		close(client.send)
+		// ⚠️ 不 close(client.send)！理由同 Run() 的注销分支：
+		// 该通道可能仍被别的客户端 goroutine 并发写入，关闭会 panic。
+		// 用 closeSend() 通知 writePump 退出即可。
+		client.closeSend()
 		delete(h.clients, client)
 	}
 	h.mu.Unlock()

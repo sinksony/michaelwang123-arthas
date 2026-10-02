@@ -473,7 +473,8 @@ func main() {
 	//
 	// Hub.Stop() 的内部行为：
 	// 1. close(done) — 通知 Hub.Run() 退出事件循环
-	// 2. 遍历所有 client，close(client.send) — 通知 writePump 退出
+	// 2. 遍历所有 client，client.closeSend()（关闭 client.done）— 通知 writePump 退出
+	//    （注意：不关闭 client.send 通道，避免「向已关闭 channel 发送」的 panic）
 	// 3. writePump 退出时发送 WebSocket Close 帧，然后关闭底层连接
 	// 4. 底层连接关闭后，readPump 的 ReadMessage() 返回错误，readPump 退出
 	//

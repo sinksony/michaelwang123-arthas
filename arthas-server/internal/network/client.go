@@ -104,6 +104,31 @@ type Client struct {
 	conn     *websocket.Conn
 	send     chan []byte
 
+	// 📚 学习要点: done 通道 — 消除「向已关闭 channel 发送」的 panic
+	//
+	// 原实现里 send 通道由 Hub.Run() 关闭（注销时 / 优雅关闭时），
+	// 而写入它的一方可能是**另一个客户端**的 readPump goroutine
+	// （文件分片是跨连接转发的，见 room.BroadcastFileData）。
+	// 二者并发，因此「先检查状态、再 close 通道」的顺序无法单独解决问题：
+	// 发送方可能已经通过状态检查、正卡在 `c.send <- data` 上，此时通道被关闭
+	// → panic: send on closed channel（整个进程崩溃，所有房间一并丢失）。
+	//
+	// 正确做法：**干脆不关闭 send 通道**。用一个关闭的 done 通道传达
+	// 「停止发送」，让通道随 Client 一起被 GC 回收。
+	// 这样「向 send 发送」在 Client 存活期间始终合法，从根本上消除该 panic。
+	//
+	// 关闭顺序变为：
+	//  1. Hub.Run() 收到注销请求，从 clients map 移除该 client
+	//  2. 调用 client.closeSend() 关闭 done（不 close send 通道）
+	//  3. writePump 的 select 观察到 done 关闭 → 写出已排队的消息后退出 → 关 conn
+	//  4. readPump 读取失败 → 退出
+	//
+	// 并发写入 send 的风险：done 之**后**才到达的发送方（文件转发）可能读到
+	// done 已关闭并跳过写入 —— 但这是安全的，因为 writePump 已经（或将）退出，
+	// 对已注销的接收方投递本就没有意义。关键是**永不 panic**。
+	done      chan struct{} // 由 closeSend 关闭，通知 writePump 退出
+	closeOnce sync.Once     // 保证 done 只关闭一次
+
 	// 消息频率限制：滑动窗口时间戳
 	msgTimestamps []int64
 	msgMu         sync.Mutex
@@ -151,6 +176,7 @@ func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		hub:      hub,
 		conn:     conn,
 		send:     make(chan []byte, sendBufferSize),
+		done:     make(chan struct{}),
 	}
 
 	// 📚 学习要点: select 实现「发送或取消」模式
@@ -229,16 +255,15 @@ func (c *Client) writePump() {
 
 	for {
 		select {
-		case message, ok := <-c.send:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if !ok {
-				// Hub 关闭了 channel
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
+		// 1. 关闭通知：优先写出 send 中尚未发送的消息，尽力保证不丢帧。
+		case <-c.done:
+			c.drainAndClose()
+			return
 
-			err := c.conn.WriteMessage(websocket.BinaryMessage, message)
-			if err != nil {
+		// 2. 有消息可发。
+		case message := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
 				return
 			}
 
@@ -260,6 +285,48 @@ func (c *Client) writePump() {
 			}
 		}
 	}
+}
+
+// drainAndClose 在连接关闭前，把 send 缓冲区中已排队的消息尽力写完，
+// 然后发送 WebSocket Close 帧。
+//
+// 📚 学习要点: 为什么不能直接 return？
+// 若收到关闭通知就立即退出，缓冲区中已经「排队等待发送」的消息会被丢弃。
+// 对于普通聊天消息影响不大，但对控制类消息（如「成员已离开」「传输取消」）
+// 会造成接收方状态不一致。这里用尽力而为（best-effort）的方式排空，
+// 且**不阻塞**：缓冲区为空即返回，不会因 peer 不读而卡住关闭流程。
+func (c *Client) drainAndClose() {
+	c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+	for {
+		select {
+		case message := <-c.send:
+			if err := c.conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
+				return // 写失败（peer 已断开）→ 直接放弃
+			}
+		default:
+			// 缓冲区已空：发送关闭帧并退出。
+			c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+			return
+		}
+	}
+}
+
+// closeSend 通知 writePump 停止并退出（幂等）。
+//
+// ⚠️ 关键：本方法**不关闭** c.send 通道。
+// send 通道的写入方可能是其它客户端的 goroutine（文件分片转发），
+// 关闭通道会导致在途发送 panic: send on closed channel。
+// 改为关闭 c.done 传达「停止发送」，c.send 交由 GC 回收。
+// 由此，向 c.send 发送在 Client 存活期间始终合法 —— panic 从根上消除。
+//
+// c.done == nil 表示该 Client 不是由 ServeWs 创建的（因而没有 writePump
+// 在监听），此时无需通知 —— 这也让零值 Client 保持可安全使用（测试友好）。
+func (c *Client) closeSend() {
+	c.closeOnce.Do(func() {
+		if c.done != nil {
+			close(c.done)
+		}
+	})
 }
 
 // Send 发送消息到客户端
@@ -328,6 +395,9 @@ func (c *Client) SendFileData(data []byte) bool {
 	select {
 	case c.send <- data:
 		return true
+	case <-c.done:
+		// 接收方已注销：立即返回，不必再等满 5s 超时。
+		return false
 	case <-time.After(fileDataSendTimeout):
 		// 接收方 send buffer 持续满 5s，认为该接收方传输失败
 		return false
